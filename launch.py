@@ -4,9 +4,9 @@
 Launch script for optimization agents.
 
 Takes a task folder path as argument. The task folder must contain:
-- config.json: Configuration file for the agent manager
+- config.json: Configuration file for the agent orchestrator
 - eval_tool.py: Evaluation tool module with an `EvalTool` class
-- Any other files requires to perform the optimization
+- Any other files required to perform the optimization
 
 Usage:
     python launch.py <task_folder>
@@ -15,16 +15,17 @@ Example:
     python launch.py tasks/chn_est
 """
 
-import sys
 import argparse
 import importlib.util
 from pathlib import Path
+import sys
 
 # Add src/ to path before importing from it
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-from agent_manager import AgentManager
 from config import load_config
+from orchestrator import AgentOrchestrator
+import printer
 
 
 def load_eval_tool(task_folder: Path):
@@ -83,7 +84,7 @@ def load_tool_factory(task_folder: Path):
 
     # Get the ToolFactory class if it exists
     if not hasattr(module, "ToolFactory"):
-        print(f"Warning: tool_factory.py exists but doesn't define 'ToolFactory' class")
+        printer.warning("Warning: tool_factory.py exists but doesn't define 'ToolFactory' class")
         return None
 
     return module.ToolFactory
@@ -99,6 +100,7 @@ Example:
     python launch.py tasks/link_adaptation
         """
     )
+
     parser.add_argument(
         "task_folder",
         type=str,
@@ -109,43 +111,45 @@ Example:
     # Resolve task folder path
     task_folder = Path(args.task_folder).resolve()
     if not task_folder.exists():
-        print(f"Error: Task folder not found: {task_folder}")
+        printer.error(f"Error: Task folder not found: {task_folder}")
         sys.exit(1)
 
     # Load configuration
     config_path = task_folder / "config.json"
     if not config_path.exists():
-        print(f"Error: config.json not found in {task_folder}")
+        printer.error(f"Error: config.json not found in {task_folder}")
         sys.exit(1)
     config = load_config(config_path)
+
+    printer.init(config.logging_config, None, "LAUNCHER")
 
     # Load the evaluation tool (required)
     try:
         EvalTool = load_eval_tool(task_folder)
     except (FileNotFoundError, AttributeError) as e:
-        print(f"Error: {e}")
+        printer.error(f"Error: {e}")
         sys.exit(1)
 
     # Load the tool factory (optional)
     ToolFactory = load_tool_factory(task_folder)
 
-    print(f"Task folder: {task_folder}")
-    print(f"Config: {config_path}")
-    print(f"Prompt: {task_folder / config.prompt_path}")
-    print(f"Eval tool: {EvalTool.__name__}")
+    printer.info(f"Task folder: {task_folder}")
+    printer.info(f"Config: {config_path}")
+    printer.info(f"Prompt: {task_folder / config.prompt_path}")
+    printer.info(f"Eval tool: {EvalTool.__name__}")
     if ToolFactory:
-        print(f"Tool factory: {ToolFactory.__name__}")
+        printer.info(f"Tool factory: {ToolFactory.__name__}")
 
-    # Create and run agent manager
-    agent_manager = AgentManager(
+    # Create and run agent orchestrator
+    orchestrator = AgentOrchestrator(
         config,
         evaluation_tool_type=EvalTool,
         task_folder=task_folder,
-        tool_factory_type=ToolFactory
+        tool_factory_type=ToolFactory,
     )
 
-    with agent_manager as manager:
-        manager.run()
+    with orchestrator:
+        orchestrator.run()
 
 
 if __name__ == "__main__":

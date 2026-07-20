@@ -4,20 +4,32 @@
 Agent module - A LangGraph/LangChain agent.
 """
 
-import os
-import re
-import signal
 from dataclasses import asdict
 from datetime import datetime
+import json
+import logging
+import signal
 from typing import Optional
 
-import numpy as np
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 
-from config import LLMConfig, WorkspaceConfig, ToolsConfig
-from tool_lib.base import ToolProvider
+from pathlib import Path
+
+from config import LLMConfig, WorkspaceConfig, ToolsConfig, HyperparameterTunerConfig
+from leaderboard import HPResult
+from tool_lib.base import EvalToolBase, ToolProvider
+from tool_lib.hyperparameter_tuner import HyperparameterTuner
 from tool_lib.workspace import Workspace
+from workspace_fs import (
+    file_exists_under_root,
+    open_journal_under_root,
+    read_text_under_root,
+    write_file_under_root,
+)
+
+_HP_MODULE_PATH = Path(__file__).parent / "tool_lib" / "hp.py"
+_HP_MODULE_SOURCE = _HP_MODULE_PATH.read_text()
 
 
 class AgentTimeoutError(BaseException):
@@ -33,29 +45,24 @@ class AgentTimeoutError(BaseException):
     pass
 
 
-DRAFT_FILE = "draft.py"
 SOLUTION_FILE = "solution.py"
+DRAFT_FILE = "draft.py"
+RESULT_FILE = "result.json"
+JOURNAL_FILE = "journal.log"
+
 
 # Prompt template to enrich the user query
-# Placeholders: original_query, assigned_approach_section, metric_direction, better_metric_description
+# Placeholders: original_query, assigned_approach_section, metric_direction
 RESULT_PROMPT_TEMPLATE = """
 You are an implementing agent in an automated optimization loop. You receive one task and one assigned approach. There is no prior conversation: this message is your only context.
 
 ## Context
 - You run in an isolated workspace with tools: read/write files, copy files, run code, and an evaluation tool.
 - Optimization target: {metric_direction} values are BETTER.
-- Your final deliverable is 'solution.py'. A post-run evaluation will score this file automatically.
+- You write your code in `draft.py`. The evaluation tool tests this file.
+- Ignore `solution.py` and `journal.log` — they are managed by the framework.
 
-## Two-file workflow
-You work with TWO files:
-1. **`draft.py`** — your scratch pad. The evaluation tool tests this file. Write, edit, and experiment here freely.
-2. **`solution.py`** — your safe vault. Use `copy_file("draft.py", "solution.py")` to save your best result. This protects your work: if you are interrupted or time out mid-experiment, `solution.py` still holds your best solution.
-
-**IMPORTANT — always save early.** The first time the evaluation tool returns SUCCESS on your own approach (not the baseline), immediately run `copy_file("draft.py", "solution.py")` — even if the metric is worse than the baseline. A saved solution you can improve on is always better than no solution at all. After that first save, overwrite `solution.py` only when you achieve a metric that is {better_metric_description} than your previously saved best.
-
-Never experiment directly in `solution.py`. Always edit `draft.py`, evaluate, and only then copy to `solution.py`.
-
-**Your goal is to achieve the best possible metric** — beat the baseline, then keep pushing further. Do NOT save the baseline code itself as your solution — only save your own novel implementations following the assigned approach.
+**Your goal is to achieve the best possible metric for the assigned approach.** When reference code is provided, use it as raw material to edit; do not submit it unchanged. When no reference is provided, implement the approach from scratch.
 
 ## Task
 {original_query}
@@ -63,7 +70,7 @@ Never experiment directly in `solution.py`. Always edit `draft.py`, evaluate, an
 ## Assigned approach (you MUST follow this)
 {assigned_approach_section}
 
-Do not switch to a different strategy. If reference code is shown, use it to understand the idea — your goal is to beat it, not reproduce it.
+Do not switch to a different strategy. If reference code is shown, it is a starting point you may rewrite freely — the assigned approach takes precedence whenever they conflict, and its headline mechanism must appear in your final `draft.py`. If during implementation you find yourself thinking the assigned approach "doesn't apply here", "reduces to" something simpler, "would need information you don't have", "is essentially equivalent to" a different method, or "isn't really meaningful in this setting" — treat that as a signal to debug your implementation, not as licence to substitute.
 
 ## Workflow
 
@@ -73,53 +80,62 @@ Read the evaluation tool description to learn the expected function signature, a
 ### Step 2 — Implement your approach
 Write your solution into `draft.py`. Use provided configuration objects; do not hardcode values. Keep all logic inline — importing installed libraries is fine, but do not import from other files you create.
 
+**Make parameters tunable**: every numerical constant or mode that affects performance (thresholds, weights, decay factors, model choices, etc.) MUST be defined using the `HP` helper:
+
+    from hp import HP
+
+    threshold = HP.get("threshold", 0.05, low=0.01, high=0.1)
+    mode = HP.get("mode", "A", choices=["A", "B", "C"])
+    lr = HP.get("lr", 1e-4, low=1e-6, high=1e-2, log=True)
+
+`HP.get(name, default, ...)` always returns `default`. Use `low`/`high` to declare the valid range, `choices` for categorical options, and `log=True` for log-scale parameters. This is mandatory for every tunable constant in your code.
+
 ### Step 3 — Evaluate
 Call the evaluation tool. It returns a metric ({metric_direction} is better), optional hints, or an error.
 
-### Step 4 — Save your result
-If this is your **first successful evaluation** (no `solution.py` yet), run `copy_file("draft.py", "solution.py")` immediately — even if the metric is worse than the baseline. Do this **before** making any further changes. If `solution.py` already exists, only overwrite it when the new metric is {better_metric_description} than your previous best.
-
-### Step 5 — Iterate
-Keep improving: adjust parameters, add algorithmic refinements, re-evaluate. Repeat Steps 2–4. Always save before risky changes. Stop only when you run out of ideas or time.
+### Step 4 — Iterate and optimize
+Keep improving: adjust parameters, add algorithmic refinements, re-evaluate. Repeat Steps 2–3.
+Stop only when you run out of ideas or time.
 
 ## Rules
 - Do not call the evaluation tool twice without changing code between calls.
 - After the first success, keep iterating — a run with only 1-2 attempts wastes your budget.
 - Do not deviate from the assigned approach.
-- Do NOT save a verbatim copy of the baseline as your solution.
-- CRITICAL: both `draft.py` and `solution.py` must be fully self-contained. All logic you write must be defined inline. Importing from installed libraries (e.g. `numpy`, `scipy`, `torch`) is fine, but do NOT import from other files you created (e.g. `from helper import solve`).
+- `draft.py` must be fully self-contained. All logic you write must be defined inline. Importing from installed libraries (e.g. `numpy`, `scipy`, `torch`) and `from hp import HP` is fine, but do NOT import from other files you created (e.g. `from helper import solve`).
 
 === END INSTRUCTIONS ===
 """
 
-# Evaluation tool output format: first line is "SUCCESS, <metric>" or "FAILURE, <metric>" or "FAILURE,"
-# Optional lines follow. Parser does not use an LLM.
-_EVAL_FIRST_LINE = re.compile(r"^(SUCCESS|FAILURE)\s*,\s*([+-]?[\d.]+)?\s*$", re.IGNORECASE)
+
+_EVAL_FIRST_LINE = EvalToolBase.RESULT_RE
 
 
-def parse_eval_output(eval_output: str) -> tuple[bool, Optional[float], Optional[str]]:
-    """Parse evaluation tool output. First line must be 'SUCCESS, <metric>' or 'FAILURE, <metric>' or 'FAILURE,'.
+def parse_eval_output(
+    eval_output: str,
+) -> tuple[bool, float | None, float | None, str | None]:
+    """Parse evaluation tool output.
+
+    Accepted formats:
+
+    * ``SUCCESS, <metric>, <complexity>`` — both values mandatory.
+    * ``FAILURE,`` — bare, no values.
 
     Returns:
-        (success, metric, info). metric is None if missing or parse fails.
-        info contains any additional lines after the first (stripped), or None if empty.
+        ``(success, metric, complexity, info)``.
+        *metric* and *complexity* are ``None`` for bare ``FAILURE,``.
     """
     if not eval_output or not isinstance(eval_output, str):
-        return False, None, None
+        return False, None, None, None
     lines = eval_output.strip().split("\n")
     first_line = lines[0].strip()
     m = _EVAL_FIRST_LINE.match(first_line)
     if not m:
-        return False, None, None
+        return False, None, None, None
     success = m.group(1).upper() == "SUCCESS"
-    metric_str = m.group(2)
     info = "\n".join(lines[1:]).strip() or None
-    if metric_str is None or metric_str == "":
-        return success, None, info
-    try:
-        return success, float(metric_str), info
-    except (ValueError, TypeError):
-        return success, None, info
+    if m.group(2) is None:
+        return success, None, None, info
+    return success, float(m.group(2)), float(m.group(3)), info
 
 
 class Agent:
@@ -132,66 +148,103 @@ class Agent:
                 evaluation_tool_type: type[ToolProvider],
                 tool_factory_type: Optional[type[ToolProvider]],
                 tools_config: ToolsConfig,
-                higher_is_better: bool = False):
+                higher_is_better: bool,
+                eval_timeout: int,
+                hp_tuner_config: HyperparameterTunerConfig,
+                gpu_id: Optional[int] = None):
         """
         Initialize the agent.
 
         Args:
             llm_config: The configuration for the language model to use.
             workspace_config: Configuration for workspace Docker containers.
-            tools_config: Configuration for tools.
             evaluation_tool_type: The type of evaluation tool provider to use.
             tool_factory_type: Optional factory class for creating additional tools.
+            tools_config: Configuration for tools.
             higher_is_better: If True, higher metric values are better (e.g., throughput).
                              If False, lower metric values are better (e.g., error rate).
+            eval_timeout: Timeout in seconds for each evaluation run.
+            hp_tuner_config: Configuration for post-process hyperparameter tuning.
+            gpu_id: Pin workspaces created by this agent to the given GPU.
+                When None, all GPUs are visible.
         """
         self.workspace_config = workspace_config
         self.higher_is_better = higher_is_better
-        self._current_journal_path = None  # Set during run() for timeout logging
+        self._gpu_id = gpu_id
+        self._current_workspace_root = None  # Set during run() for timeout logging
 
         # Build the LLM
         self.llm = ChatOpenAI(**asdict(llm_config))
+        # Silence HTTP-level chatter from the individual HTTP requests
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+
+        # Evaluation tool
+        self.evaluation_tool = evaluation_tool_type(
+            eval_timeout=eval_timeout,
+            higher_is_better=higher_is_better,
+        )
 
         # Create task-specific tools from factory (if provided)
         self.tool_factory = None
         if tool_factory_type is not None:
-            self.tool_factory = tool_factory_type(tools_config)
+            self.tool_factory = tool_factory_type(
+                tools_config,
+                eval_tool=self.evaluation_tool,
+                higher_is_better=higher_is_better,
+            )
 
-        # Evaluation tool
-        eval_timeout = tools_config.get("eval_timeout", 120)
-        self.evaluation_tool = evaluation_tool_type(eval_timeout=eval_timeout)
+        # Post-process hyperparameter tuner
+        self.hp_tuner = HyperparameterTuner(
+            eval_tool=self.evaluation_tool,
+            higher_is_better=higher_is_better,
+            n_trials=hp_tuner_config.n_trials,
+            timeout=hp_tuner_config.timeout,
+        )
 
-    def enrich_query(self, query: str, assigned_approach_section: str = "") -> str:
+    def enrich_query(
+        self,
+        query: str,
+        assigned_approach_section: str = "",
+        prompt_template: str = "",
+    ) -> str:
         """
         Enrich the original query with instructions and the assigned approach section.
 
-        The assigned approach section is built by the agent manager (idea description
-        followed by its reference code). This method only injects it into the template.
+        The assigned approach section is built by the orchestrator (idea description
+        followed by its reference code). This method injects it into the template.
 
         Args:
             query: The original user query.
-            assigned_approach_section: Pre-built section from the manager (idea + its reference code).
+            assigned_approach_section: Pre-built section from the orchestrator (idea + its reference code).
+            prompt_template: Optional override for RESULT_PROMPT_TEMPLATE.
+                If non-empty, used instead of the default template.
 
         Returns:
             The enriched query with instructions and assigned approach section.
         """
         if not assigned_approach_section.strip():
             assigned_approach_section = "(No specific approach assigned.)"
-        metric_direction = "HIGHER" if self.higher_is_better else "LOWER"
-        better_metric_description = "higher" if self.higher_is_better else "lower"
-        return RESULT_PROMPT_TEMPLATE.format(
-            original_query=query,
-            assigned_approach_section=assigned_approach_section,
-            metric_direction=metric_direction,
-            better_metric_description=better_metric_description,
+        template = (
+            prompt_template
+            if prompt_template and prompt_template.strip()
+            else RESULT_PROMPT_TEMPLATE
         )
+        metric_direction = "HIGHER" if self.higher_is_better else "LOWER"
 
-    def _log_message(self, journal_path: str, msg) -> None:
+        # Use .replace() instead of .format() so that LLM-refined templates
+        # containing literal curly braces don't crash with KeyError/ValueError.
+        result = template
+        result = result.replace("{original_query}", query)
+        result = result.replace("{assigned_approach_section}", assigned_approach_section)
+        result = result.replace("{metric_direction}", metric_direction)
+        return result
+
+    def _log_message(self, ws_root: Path, msg) -> None:
         """
         Log a message to the journal file.
 
         Args:
-            journal_path: Path to the journal.log file.
+            ws_root: Host path to the workspace directory.
             msg: The message object to log.
         """
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -228,7 +281,7 @@ class Agent:
             lines.append(f"[{timestamp}] [{msg.type.upper()}]\n{content}")
 
         if lines:
-            with open(journal_path, "a", encoding="utf-8") as f:
+            with open_journal_under_root(ws_root, JOURNAL_FILE, "a") as f:
                 for line in lines:
                     f.write(line + "\n\n")
 
@@ -240,87 +293,132 @@ class Agent:
             signum: Signal number.
             frame: Current stack frame.
         """
-        if self._current_journal_path:
+        if self._current_workspace_root:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            with open(self._current_journal_path, "a", encoding="utf-8") as f:
+            with open_journal_under_root(
+                self._current_workspace_root, JOURNAL_FILE, "a",
+            ) as f:
                 f.write(f"[{timestamp}] [TIMEOUT] Agent execution timed out\n\n")
 
         raise AgentTimeoutError("Agent execution timed out")
 
-    def _run_post_agent_evaluation(self, workspace: Workspace, journal_path: str) -> None:
-        """Run the evaluation tool in the workspace and save result to result.npy.
+    def _run_post_processing(self, workspace: Workspace) -> None:
+        """Run HP tuning (if applicable) and save result.json.
 
-        Evaluation tools must implement run_evaluation(filename: str) -> str so that
-        POST_EVAL always evaluates the configured solution file.
+        1. If ``solution.py`` or ``draft.py`` exists and contains tunable
+           ``HP.get()`` calls, run multi-objective Optuna HP tuning.  The
+           tuner returns a list of Pareto-optimal :class:`HPResult` entries
+           and writes ``pareto_params.json`` to the workspace.
+        2. If tuning was skipped (no ``HP.get()`` calls) or failed,
+           run a standalone evaluation and produce a single HPResult.
+        3. If neither file exists, write a failure ``result.json`` so any
+           container-written result file is overwritten.
 
-        If solution.py does not exist but draft.py does, draft.py is used as a fallback
-        so that work-in-progress is not silently discarded on timeout.
+        The ``result.json`` dict has the shape::
 
-        result.npy is saved as a dict {'success': bool, 'metric': float|None, 'info': str|None}:
-        - On success: metric holds the parsed float, info holds any additional output lines.
-        - On failure: metric is None, info holds the error message or full evaluation output.
-        result.npy is not saved if neither solution.py nor draft.py exist.
+            {"success": True,
+             "results": [{"hp_index": 0, "metric": ..., "complexity": ...}, ...]}
         """
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        if not hasattr(self.evaluation_tool, "run_evaluation") or not callable(
-            getattr(self.evaluation_tool, "run_evaluation")
-        ):
-            with open(journal_path, "a", encoding="utf-8") as f:
-                f.write(
-                    f"[{timestamp}] [POST_EVAL] Evaluation tool must implement run_evaluation(filename); skipping\n\n"
-                )
-            return
-
-        solution_path = workspace._host_workspace_path / SOLUTION_FILE
-        draft_path = workspace._host_workspace_path / DRAFT_FILE
-
-        # Determine which file to evaluate: prefer solution.py, fall back to draft.py
-        if solution_path.exists():
-            eval_file = SOLUTION_FILE
-        elif draft_path.exists():
-            eval_file = DRAFT_FILE
-            with open(journal_path, "a", encoding="utf-8") as f:
-                f.write(
-                    f"[{timestamp}] [POST_EVAL] '{SOLUTION_FILE}' not found; falling back to '{DRAFT_FILE}'\n\n"
-                )
-        else:
-            with open(journal_path, "a", encoding="utf-8") as f:
-                f.write(
-                    f"[{timestamp}] [POST_EVAL] Neither '{SOLUTION_FILE}' nor '{DRAFT_FILE}' found; not saving result.npy\n\n"
-                )
-            return
-
         def _save_result(result_dict: dict) -> None:
             try:
-                np.save(str(workspace._host_workspace_path / "result.npy"), result_dict, allow_pickle=True)
+                write_file_under_root(
+                    ws_path, RESULT_FILE, json.dumps(result_dict),
+                )
             except Exception as save_e:
-                with open(journal_path, "a", encoding="utf-8") as f:
-                    f.write(f"[{timestamp}] [POST_EVAL] Save failed: {save_e}\n\n")
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                with open_journal_under_root(ws_path, JOURNAL_FILE, "a") as f:
+                    f.write(f"[{ts}] [POST_EVAL] Save failed: {save_e}\n\n")
 
+        ws_path = workspace._host_workspace_path
+        if file_exists_under_root(ws_path, SOLUTION_FILE):
+            eval_file = SOLUTION_FILE
+        elif file_exists_under_root(ws_path, DRAFT_FILE):
+            eval_file = DRAFT_FILE
+        else:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open_journal_under_root(ws_path, JOURNAL_FILE, "a") as f:
+                f.write(
+                    f"[{timestamp}] [POST_EVAL] Neither '{SOLUTION_FILE}' nor "
+                    f"'{DRAFT_FILE}' found; saving failure {RESULT_FILE}\n\n"
+                )
+            _save_result({"success": False, "results": []})
+            return
+
+        # --- Phase 1: hyperparameter tuning ---
+        hp_results: list[HPResult] = []
+        source = read_text_under_root(ws_path, eval_file)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open_journal_under_root(ws_path, JOURNAL_FILE, "a") as f:
+            f.write(
+                f"[{timestamp}] [POST_HP_TUNE] Starting hyperparameter "
+                f"tuning on {eval_file}\n\n"
+            )
+        try:
+            self.hp_tuner.set_workspace(workspace)
+            message, hp_results = self.hp_tuner.tune(
+                source=source, filename=eval_file,
+            )
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open_journal_under_root(ws_path, JOURNAL_FILE, "a") as f:
+                f.write(f"[{timestamp}] [POST_HP_TUNE] Result:\n{message}\n\n")
+        except Exception as e:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open_journal_under_root(ws_path, JOURNAL_FILE, "a") as f:
+                f.write(f"[{timestamp}] [POST_HP_TUNE] Failed: {e}\n\n")
+
+        if hp_results:
+            _save_result({
+                "success": True,
+                "results": [hp.to_dict() for hp in hp_results],
+            })
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open_journal_under_root(ws_path, JOURNAL_FILE, "a") as f:
+                f.write(
+                    f"[{timestamp}] [POST_EVAL] Saved {len(hp_results)} "
+                    f"Pareto-optimal results to {RESULT_FILE} (from HP tuning)\n\n"
+                )
+            return
+
+        # --- Phase 2: standalone evaluation (tuning skipped or failed) ---
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         try:
             eval_output = self.evaluation_tool.run_evaluation(eval_file)
             if not isinstance(eval_output, str):
                 eval_output = str(eval_output)
         except Exception as e:
             error_msg = str(e)
-            with open(journal_path, "a", encoding="utf-8") as f:
-                f.write(f"[{timestamp}] [POST_EVAL] Evaluation tool failed: {error_msg}\n\n")
-            _save_result({"success": False, "metric": None, "info": error_msg})
-            with open(journal_path, "a", encoding="utf-8") as f:
-                f.write(f"[{timestamp}] [POST_EVAL] Saved failure result.npy with error message\n\n")
+            with open_journal_under_root(ws_path, JOURNAL_FILE, "a") as f:
+                f.write(
+                    f"[{timestamp}] [POST_EVAL] Evaluation tool failed: "
+                    f"{error_msg}\n\n"
+                )
+            _save_result({"success": False, "results": []})
             return
 
-        with open(journal_path, "a", encoding="utf-8") as f:
-            f.write(f"[{timestamp}] [POST_EVAL] Evaluation output ({eval_file}):\n{eval_output}\n\n")
-        success, metric, info = parse_eval_output(eval_output)
+        with open_journal_under_root(ws_path, JOURNAL_FILE, "a") as f:
+            f.write(
+                f"[{timestamp}] [POST_EVAL] Evaluation output "
+                f"({eval_file}):\n{eval_output}\n\n"
+            )
+        success, metric, complexity, info = parse_eval_output(eval_output)
         if not success or metric is None:
-            with open(journal_path, "a", encoding="utf-8") as f:
-                f.write(f"[{timestamp}] [POST_EVAL] Evaluation did not succeed or no metric; saving failure result.npy\n\n")
-            _save_result({"success": False, "metric": None, "info": eval_output})
+            with open_journal_under_root(ws_path, JOURNAL_FILE, "a") as f:
+                f.write(
+                    f"[{timestamp}] [POST_EVAL] Evaluation did not succeed; "
+                    f"saving failure {RESULT_FILE}\n\n"
+                )
+            _save_result({"success": False, "results": []})
             return
-        _save_result({"success": True, "metric": metric, "info": info})
-        with open(journal_path, "a", encoding="utf-8") as f:
-            f.write(f"[{timestamp}] [POST_EVAL] Saved metric {metric} to result.npy\n\n")
+
+        _save_result({
+            "success": True,
+            "results": [{"hp_index": 0, "metric": metric, "complexity": complexity}],
+        })
+        with open_journal_under_root(ws_path, JOURNAL_FILE, "a") as f:
+            f.write(
+                f"[{timestamp}] [POST_EVAL] Saved metric={metric}, "
+                f"complexity={complexity} to {RESULT_FILE}\n\n"
+            )
 
     def run(
         self,
@@ -328,6 +426,7 @@ class Agent:
         query: str,
         timeout: Optional[int] = None,
         assigned_approach_section: str = "",
+        prompt_template: str = "",
     ) -> str:
         """
         Run the agent on a query and return the final response.
@@ -337,7 +436,10 @@ class Agent:
             query: The user query to process.
             timeout: Optional timeout in seconds for the agent run.
                      If None, no timeout is applied.
-            assigned_approach_section: Pre-built section from the manager (idea followed by its reference code).
+            assigned_approach_section: Pre-built section from the orchestrator
+                (idea followed by its reference code).
+            prompt_template: Optional override for the default prompt template.
+                If non-empty, used instead of RESULT_PROMPT_TEMPLATE.
 
         Returns:
             The final AI response as a string.
@@ -345,13 +447,12 @@ class Agent:
         Raises:
             AgentTimeoutError: If the agent execution exceeds the timeout.
         """
-        # Enrich query with instructions and the assigned approach section (manager-built)
-        effective_query = self.enrich_query(query, assigned_approach_section)
+        effective_query = self.enrich_query(
+            query, assigned_approach_section, prompt_template,
+        )
 
-        # Set up journal log path in the workspace directory (needed for timeout logging)
-        workspace_dir = os.path.join(self.workspace_config.path, workspace_id)
-        journal_path = os.path.join(workspace_dir, "journal.log")
-        self._current_journal_path = journal_path
+        ws_root = Path(self.workspace_config.base_path) / workspace_id
+        self._current_workspace_root = ws_root
 
         # Set up timeout if specified
         if timeout is not None:
@@ -361,26 +462,27 @@ class Agent:
         try:
             # Use context manager for automatic workspace cleanup after run
             # No workspace inheritance - each candidate starts fresh
-            with Workspace(workspace_id,
-                          host_workspace_path=self.workspace_config.path,
-                          docker_image=self.workspace_config.docker_image,
-                          memory_limit=self.workspace_config.memory_limit,
-                          pids_limit=self.workspace_config.pids_limit,
-                          use_gpu=self.workspace_config.use_gpu) as workspace:
+            with Workspace(workspace_id=workspace_id,
+                           gpu_id=self._gpu_id,
+                           cfg=self.workspace_config) as workspace:
                 # Write the query as the first entry in the journal
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                with open(journal_path, "w", encoding="utf-8") as f:
+                with open_journal_under_root(ws_root, JOURNAL_FILE, "w") as f:
                     f.write(f"[{timestamp}] [QUERY]\n{effective_query}\n\n")
 
                 # Set workspace on tool factory (if provided)
                 if self.tool_factory is not None:
                     self.tool_factory.set_workspace(workspace)
 
-                # Set workspace on evaluation tool for tool invocation
+                # Set workspace on evaluation tool
                 self.evaluation_tool.set_workspace(workspace)
 
+                # Copy the HP helper module into the workspace
+                workspace._write_file("hp.py", _HP_MODULE_SOURCE)
+
                 # Collect all tools
-                tools = workspace.get_tools() + self.evaluation_tool.get_tools()
+                tools = (workspace.get_tools()
+                         + self.evaluation_tool.get_tools())
                 if self.tool_factory is not None:
                     tools += self.tool_factory.get_tools()
                 # Build the agent
@@ -397,7 +499,7 @@ class Agent:
                             if "messages" in node_output:
                                 for msg in node_output["messages"]:
                                     # Log all messages to journal
-                                    self._log_message(journal_path, msg)
+                                    self._log_message(ws_root, msg)
                                     if hasattr(msg, "tool_calls") and msg.tool_calls:
                                         tool_call_count += len(msg.tool_calls)
                                     if msg.type == "ai":
@@ -413,17 +515,16 @@ class Agent:
                                             else content
                                         )
                 except AgentTimeoutError:
-                    # Timeout: cancel alarm and run POST_EVAL in same workspace, then re-raise.
                     if timeout is not None:
                         signal.alarm(0)
-                    self._run_post_agent_evaluation(workspace, journal_path)
+                    self._run_post_processing(workspace)
                     raise
 
                 # Normal completion: run POST_EVAL (cancel alarm so it is not interrupted).
                 if timeout is not None:
                     signal.alarm(0)
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                with open(journal_path, "a", encoding="utf-8") as f:
+                with open_journal_under_root(ws_root, JOURNAL_FILE, "a") as f:
                     f.write(
                         f"[{timestamp}] [RUN_END] tool_calls={tool_call_count} | "
                         f"last_ai_has_tool_calls={last_ai_has_tool_calls} | "
@@ -432,7 +533,7 @@ class Agent:
                     if last_ai_content_preview:
                         f.write(f"[{timestamp}] [RUN_END] last_ai_content_preview: {last_ai_content_preview!r}\n")
                     f.write("\n")
-                self._run_post_agent_evaluation(workspace, journal_path)
+                self._run_post_processing(workspace)
             return final_response
 
         finally:

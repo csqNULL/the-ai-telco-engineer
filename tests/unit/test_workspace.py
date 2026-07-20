@@ -7,6 +7,7 @@ Requires:
   - Docker daemon running
   - DOCKER_IMAGE available (default: python:3.12-slim; will be pulled if missing)
 """
+#pylint: disable=W0212 (Access to a protected member _install_package of a client class)
 
 import pytest
 import subprocess
@@ -17,6 +18,7 @@ from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
+from config import WorkspaceConfig, ContainerConfig
 from tool_lib.workspace import Workspace
 
 
@@ -32,6 +34,7 @@ def docker_available() -> bool:
     try:
         result = subprocess.run(
             ["docker", "info"],
+            check=False,
             capture_output=True,
             timeout=10
         )
@@ -44,6 +47,7 @@ def cleanup_container(container_name: str):
     """Force remove a container if it exists."""
     subprocess.run(
         ["docker", "rm", "-f", container_name],
+        check=False,
         capture_output=True,
         timeout=30
     )
@@ -67,9 +71,23 @@ def workspace_id():
     """Generate a unique workspace ID for each test."""
     return f"test_{uuid.uuid4().hex[:8]}"
 
+@pytest.fixture
+def workspace_cfg():
+    return WorkspaceConfig(
+        base_path=str(HOST_WORKSPACE_BASE),
+        container=ContainerConfig(
+            docker_image=DOCKER_IMAGE,
+            dockerfile_path=None,
+            memory_limit="16g",
+            pids_limit=2048,
+            use_gpu=False,
+            workspace_mount_point=DOCKER_WORKSPACE_PATH,
+        ),
+    )
+
 
 @pytest.fixture
-def workspace(workspace_id):
+def workspace(workspace_id, workspace_cfg):
     """Create a workspace and clean up after the test."""
     # Ensure base directory exists
     HOST_WORKSPACE_BASE.mkdir(parents=True, exist_ok=True)
@@ -77,11 +95,8 @@ def workspace(workspace_id):
     ws = None
     try:
         ws = Workspace(
+            cfg=workspace_cfg,
             workspace_id=workspace_id,
-            host_workspace_path=str(HOST_WORKSPACE_BASE),
-            docker_workspace_path=DOCKER_WORKSPACE_PATH,
-            docker_image=DOCKER_IMAGE,
-            use_gpu=False,
         )
         yield ws
     finally:
@@ -101,31 +116,29 @@ class TestWorkspaceInitialization:
     """Tests for workspace initialization."""
 
     def test_workspace_creates_host_directory(self, workspace, workspace_id):
-        """Test that workspace creates host directory."""
+        """Test that workspace creates host directory, sets attributes correctly
+        and starts a Docker container."""
         host_path = HOST_WORKSPACE_BASE / workspace_id
         assert host_path.exists()
         assert host_path.is_dir()
 
-    def test_workspace_starts_container(self, workspace):
-        """Test that workspace starts a Docker container."""
+        assert workspace._workspace_id == workspace_id
+        assert workspace._host_workspace_path == HOST_WORKSPACE_BASE / workspace_id
+        assert workspace._host_parent_workspace_path is None
+
         result = subprocess.run(
-            ["docker", "inspect", workspace._container_name],
+            ["docker", "inspect", workspace._container.name],
+            check=False,
             capture_output=True,
             text=True
         )
         assert result.returncode == 0, "Container should be running"
 
-    def test_workspace_attributes(self, workspace, workspace_id):
-        """Test workspace attributes are set correctly."""
-        assert workspace._workspace_id == workspace_id
-        assert workspace._host_workspace_path == HOST_WORKSPACE_BASE / workspace_id
-        assert workspace._docker_workspace_path == Path(DOCKER_WORKSPACE_PATH)
-
 
 class TestParentWorkspaceInheritance:
     """Tests for parent workspace inheritance."""
 
-    def test_child_workspace_copies_parent_files(self):
+    def test_child_workspace_copies_parent_files(self, workspace_cfg):
         """Test that child workspace inherits files from parent."""
         parent_id = f"parent_{uuid.uuid4().hex[:8]}"
         child_id = f"child_{uuid.uuid4().hex[:8]}"
@@ -139,10 +152,7 @@ class TestParentWorkspaceInheritance:
             # Create parent workspace
             parent_ws = Workspace(
                 workspace_id=parent_id,
-                host_workspace_path=str(HOST_WORKSPACE_BASE),
-                docker_workspace_path=DOCKER_WORKSPACE_PATH,
-                docker_image=DOCKER_IMAGE,
-                use_gpu=False,
+                cfg=workspace_cfg
             )
 
             # Create a file in parent workspace
@@ -155,11 +165,8 @@ class TestParentWorkspaceInheritance:
             # Create child workspace from parent
             child_ws = Workspace(
                 workspace_id=child_id,
-                host_workspace_path=str(HOST_WORKSPACE_BASE),
-                docker_workspace_path=DOCKER_WORKSPACE_PATH,
+                cfg=workspace_cfg,
                 parent_workspace_id=parent_id,
-                docker_image=DOCKER_IMAGE,
-                use_gpu=False,
             )
 
             # Verify child has the inherited file
@@ -180,18 +187,15 @@ class TestParentWorkspaceInheritance:
             cleanup_workspace_dir(HOST_WORKSPACE_BASE / parent_id)
             cleanup_workspace_dir(HOST_WORKSPACE_BASE / child_id)
 
-    def test_parent_not_exists_raises_error(self):
+    def test_parent_not_exists_raises_error(self, workspace_cfg):
         """Test that creating child from non-existent parent raises error."""
         child_id = f"orphan_{uuid.uuid4().hex[:8]}"
 
         with pytest.raises(ValueError, match="does not exist"):
             Workspace(
                 workspace_id=child_id,
-                host_workspace_path=str(HOST_WORKSPACE_BASE),
-                docker_workspace_path=DOCKER_WORKSPACE_PATH,
+                cfg=workspace_cfg,
                 parent_workspace_id="nonexistent_parent",
-                docker_image=DOCKER_IMAGE,
-                use_gpu=False,
             )
 
 
@@ -200,17 +204,17 @@ class TestExecCommand:
 
     def test_exec_returns_stdout_on_success(self, workspace):
         """Test _exec returns stdout when command succeeds."""
-        success, output = workspace._exec("echo 'hello world'")
+        success, output = workspace._container.exec(["echo", "hello world"])
 
         assert success is True
         assert "hello world" in output
 
     def test_exec_returns_stderr_on_failure(self, workspace):
         """Test _exec returns stderr when command fails."""
-        success, output = workspace._exec("ls /nonexistent_path_12345")
+        success, output = workspace._container.exec(["ls", "/nonexistent_path_12345"])
 
         assert success is False
-        assert "No such file" in output or "cannot access" in output
+        assert ("No such file" in output) or ("cannot access" in output)
 
 
 class TestRunPythonCode:
@@ -218,19 +222,19 @@ class TestRunPythonCode:
 
     def test_run_simple_python_code(self, workspace):
         """Test running simple Python code."""
-        result = workspace._run_python_code("print('Hello from Python!')")
+        result = workspace._container.run_python_code("print('Hello from Python!')")
 
         assert "Hello from Python!" in result
 
     def test_run_python_code_with_computation(self, workspace):
         """Test running Python code with computation."""
-        result = workspace._run_python_code("print(sum(range(10)))")
+        result = workspace._container.run_python_code("print(sum(range(10)))")
 
         assert "45" in result
 
     def test_run_python_code_with_error(self, workspace):
         """Test running Python code that raises an error."""
-        result = workspace._run_python_code("print(undefined_variable)")
+        result = workspace._container.run_python_code("print(undefined_variable)")
 
         assert "Error" in result
         assert "NameError" in result
@@ -242,7 +246,7 @@ x = 10
 y = 20
 print(f"Sum: {x + y}")
 """
-        result = workspace._run_python_code(code)
+        result = workspace._container.run_python_code(code)
 
         assert "Sum: 30" in result
 
@@ -256,13 +260,13 @@ class TestRunPythonScript:
         workspace._write_file("test_script.py", "print('Script executed!')")
 
         # Run the script
-        result = workspace._run_python_script("test_script.py")
+        result = workspace._container.run_python_script("test_script.py")
 
         assert "Script executed!" in result
 
     def test_run_python_script_not_found(self, workspace):
         """Test running a non-existent script."""
-        result = workspace._run_python_script("nonexistent_script.py")
+        result = workspace._container.run_python_script("nonexistent_script.py")
 
         assert "Error" in result
 
@@ -355,6 +359,7 @@ class TestDeleteOperations:
     def test_delete_file(self, workspace):
         """Test deleting a file."""
         workspace._write_file("to_delete.txt", "content")
+        assert "to_delete.txt" in workspace._list_dir(".")
 
         result = workspace._delete("to_delete.txt")
         assert "Successfully" in result
@@ -367,6 +372,8 @@ class TestDeleteOperations:
         """Test deleting a directory recursively."""
         workspace._create_dir("dir_to_delete")
         workspace._write_file("dir_to_delete/file.txt", "content")
+        assert "dir_to_delete" in workspace._list_dir(".")
+        assert "file.txt" in workspace._list_dir("dir_to_delete")
 
         result = workspace._delete("dir_to_delete")
         assert "Successfully" in result
@@ -379,22 +386,20 @@ class TestDeleteOperations:
 class TestStopWorkspace:
     """Tests for stopping workspace."""
 
-    def test_stop_workspace_stops_container(self, workspace_id):
+    def test_stop_workspace_stops_container(self, workspace_id, workspace_cfg):
         """Test that stop_workspace stops the container."""
         HOST_WORKSPACE_BASE.mkdir(parents=True, exist_ok=True)
 
         ws = Workspace(
             workspace_id=workspace_id,
-            host_workspace_path=str(HOST_WORKSPACE_BASE),
-            docker_workspace_path=DOCKER_WORKSPACE_PATH,
-            docker_image=DOCKER_IMAGE,
-            use_gpu=False,
+            cfg=workspace_cfg,
         )
-        container_name = ws._container_name
+        container_name = ws._container.name
 
         # Verify container is running
         result = subprocess.run(
             ["docker", "inspect", container_name],
+            check=False,
             capture_output=True
         )
         assert result.returncode == 0, "Container should be running"
@@ -405,6 +410,7 @@ class TestStopWorkspace:
         # Verify container is stopped (inspect should fail or show stopped state)
         result = subprocess.run(
             ["docker", "inspect", "-f", "{{.State.Running}}", container_name],
+            check=False,
             capture_output=True,
             text=True
         )
@@ -415,17 +421,14 @@ class TestStopWorkspace:
         cleanup_container(container_name)
         cleanup_workspace_dir(HOST_WORKSPACE_BASE / workspace_id)
 
-    def test_stop_workspace_removes_host_files(self, workspace_id):
+    def test_stop_workspace_removes_host_files(self, workspace_id, workspace_cfg):
         """Test that stop_workspace can remove host files."""
         HOST_WORKSPACE_BASE.mkdir(parents=True, exist_ok=True)
         host_path = HOST_WORKSPACE_BASE / workspace_id
 
         ws = Workspace(
             workspace_id=workspace_id,
-            host_workspace_path=str(HOST_WORKSPACE_BASE),
-            docker_workspace_path=DOCKER_WORKSPACE_PATH,
-            docker_image=DOCKER_IMAGE,
-            use_gpu=False,
+            cfg=workspace_cfg,
         )
 
         # Create a file
@@ -586,12 +589,12 @@ class TestInstallPackage:
     def test_install_package_success(self, workspace):
         """Test installing a package."""
         # Install a small, quick package
-        result = workspace._install_package("pandas")
+        result = workspace._container.install_package("pandas")
 
         assert "successfully" in result.lower() or "already" in result.lower()
 
     def test_install_nonexistent_package(self, workspace):
         """Test installing a package that doesn't exist."""
-        result = workspace._install_package("this_package_definitely_does_not_exist_12345")
+        result = workspace._container.install_package("this_package_definitely_does_not_exist_12345")
 
         assert "Error" in result

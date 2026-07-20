@@ -5,9 +5,7 @@ import hashlib
 import importlib
 import inspect
 import json
-import logging
 import os
-import pickle
 import pkgutil
 import re
 from concurrent.futures import ThreadPoolExecutor
@@ -25,6 +23,8 @@ from langchain.agents import create_agent
 from bs4 import BeautifulSoup
 from markdownify import markdownify as md
 from langchain_core.documents import Document
+
+SIONNA_DOC_URL = "https://nvlabs.github.io/sionna"
 
 
 class HttpEmbeddings:
@@ -52,6 +52,8 @@ class HttpEmbeddings:
             raise RuntimeError(
                 f"Embedding request failed ({exc.code}): {body}"
             ) from exc
+        except Exception as e:
+            raise RuntimeError(f"Embedding request to URL {self._url} failed: {e}") from e
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         all_embeddings: list[list[float]] = []
@@ -132,12 +134,44 @@ class FaissVectorStore:
 
         return cls(embeddings, index, docstore, index_to_id)
 
+    @staticmethod
+    def _serialize_docstore(docstore: dict[str, Document]) -> dict:
+        return {
+            doc_id: {
+                "page_content": doc.page_content,
+                "metadata": doc.metadata,
+            }
+            for doc_id, doc in docstore.items()
+        }
+
+    @staticmethod
+    def _deserialize_docstore(data: dict) -> dict[str, Document]:
+        return {
+            doc_id: Document(
+                page_content=entry["page_content"],
+                metadata=entry.get("metadata", {}),
+            )
+            for doc_id, entry in data.items()
+        }
+
+    @classmethod
+    def load_metadata(cls, path: Path) -> tuple[dict[str, Document], dict[int, str]]:
+        with open(path / "index.json") as f:
+            data = json.load(f)
+        docstore = cls._deserialize_docstore(data["docstore"])
+        index_to_id = {int(k): v for k, v in data["index_to_id"].items()}
+        return docstore, index_to_id
+
     def save_local(self, path: str) -> None:
         p = Path(path)
         p.mkdir(parents=True, exist_ok=True)
         faiss_lib.write_index(self._index, str(p / "index.faiss"))
-        with open(p / "index.pkl", "wb") as f:
-            pickle.dump((self._docstore, self._index_to_id), f)
+        payload = {
+            "docstore": self._serialize_docstore(self._docstore),
+            "index_to_id": {str(k): v for k, v in self._index_to_id.items()},
+        }
+        with open(p / "index.json", "w") as f:
+            json.dump(payload, f)
 
     def similarity_search(self, query: str, k: int = 4) -> list[Document]:
         vector = np.array([self._embeddings.embed_query(query)], dtype=np.float32)
@@ -167,46 +201,60 @@ class SionnaDoc(ToolProvider):
     shared across processes.
     """
 
-    _VALID_SYMBOL_RE = re.compile(r"^[a-zA-Z_][\w.]*$")
+    _VALID_SYMBOL_RE = re.compile(r"^sionna(?:\.[a-zA-Z_]\w*)*$")
+
+    _RESOLVE_DOTTED_PY = """
+def _resolve_dotted(name):
+    parts = name.split(".")
+    for part in parts:
+        if part.startswith("__"):
+            raise ValueError("Dunder access not allowed: " + repr(part))
+    obj = __import__(parts[0])
+    for part in parts[1:]:
+        obj = getattr(obj, part)
+    return obj
+""".strip()
 
     TUTORIAL_DOC_URLS = [
-        # RT
-        "https://nvlabs.github.io/sionna/rt/tutorials/Introduction.html",
-        "https://nvlabs.github.io/sionna/rt/tutorials/Diffraction.html",
-        "https://nvlabs.github.io/sionna/rt/tutorials/Mobility.html",
-        "https://nvlabs.github.io/sionna/rt/tutorials/Radio-Maps.html",
-        "https://nvlabs.github.io/sionna/rt/tutorials/Scattering.html",
-        "https://nvlabs.github.io/sionna/rt/tutorials/Scene-Edit.html",
-        # PHY
-        "https://nvlabs.github.io/sionna/phy/tutorials/notebooks/Hello_World.html",
-        "https://nvlabs.github.io/sionna/phy/tutorials/notebooks/Sionna_tutorial_part1.html",
-        "https://nvlabs.github.io/sionna/phy/tutorials/notebooks/Sionna_tutorial_part2.html",
-        "https://nvlabs.github.io/sionna/phy/tutorials/notebooks/Sionna_tutorial_part3.html",
-        "https://nvlabs.github.io/sionna/phy/tutorials/notebooks/Sionna_tutorial_part4.html",
-        "https://nvlabs.github.io/sionna/phy/tutorials/notebooks/Simple_MIMO_Simulation.html",
-        "https://nvlabs.github.io/sionna/phy/tutorials/notebooks/Pulse_Shaping_Basics.html",
-        "https://nvlabs.github.io/sionna/phy/tutorials/notebooks/Optical_Lumped_Amplification_Channel.html",
-        "https://nvlabs.github.io/sionna/phy/tutorials/notebooks/5G_Channel_Coding_Polar_vs_LDPC_Codes.html",
-        "https://nvlabs.github.io/sionna/phy/tutorials/notebooks/5G_NR_PUSCH.html",
-        "https://nvlabs.github.io/sionna/phy/tutorials/notebooks/Bit_Interleaved_Coded_Modulation.html",
-        "https://nvlabs.github.io/sionna/phy/tutorials/notebooks/MIMO_OFDM_Transmissions_over_CDL.html",
-        "https://nvlabs.github.io/sionna/phy/tutorials/notebooks/Neural_Receiver.html",
-        "https://nvlabs.github.io/sionna/phy/tutorials/notebooks/Realistic_Multiuser_MIMO_Simulations.html",
-        "https://nvlabs.github.io/sionna/phy/tutorials/notebooks/OFDM_MIMO_Detection.html",
-        "https://nvlabs.github.io/sionna/phy/tutorials/notebooks/Introduction_to_Iterative_Detection_and_Decoding.html",
-        "https://nvlabs.github.io/sionna/phy/tutorials/notebooks/Autoencoder.html",
-        "https://nvlabs.github.io/sionna/phy/tutorials/notebooks/Weighted_BP_Algorithm.html",
-        "https://nvlabs.github.io/sionna/phy/tutorials/notebooks/Superimposed_Pilots.html",
-        "https://nvlabs.github.io/sionna/phy/tutorials/notebooks/CIR_Dataset.html",
-        "https://nvlabs.github.io/sionna/phy/tutorials/notebooks/Link_Level_Simulations_with_RT.html",
-        # SYS
-        "https://nvlabs.github.io/sionna/sys/tutorials/notebooks/PHY_Abstraction.html",
-        "https://nvlabs.github.io/sionna/sys/tutorials/notebooks/LinkAdaptation.html",
-        "https://nvlabs.github.io/sionna/sys/tutorials/notebooks/Scheduling.html",
-        "https://nvlabs.github.io/sionna/sys/tutorials/notebooks/HexagonalGrid.html",
-        "https://nvlabs.github.io/sionna/sys/tutorials/notebooks/Power_Control.html",
-        "https://nvlabs.github.io/sionna/sys/tutorials/notebooks/SYS_Meets_RT.html",
-        "https://nvlabs.github.io/sionna/sys/tutorials/notebooks/End-to-End_Example.html"
+        SIONNA_DOC_URL + v for v in [
+            # RT
+            "/rt/tutorials/Introduction.html",
+            "/rt/tutorials/Diffraction.html",
+            "/rt/tutorials/Mobility.html",
+            "/rt/tutorials/Radio-Maps.html",
+            "/rt/tutorials/Scattering.html",
+            "/rt/tutorials/Scene-Edit.html",
+            # PHY
+            "/phy/tutorials/notebooks/Hello_World.html",
+            "/phy/tutorials/notebooks/Sionna_tutorial_part1.html",
+            "/phy/tutorials/notebooks/Sionna_tutorial_part2.html",
+            "/phy/tutorials/notebooks/Sionna_tutorial_part3.html",
+            "/phy/tutorials/notebooks/Sionna_tutorial_part4.html",
+            "/phy/tutorials/notebooks/Simple_MIMO_Simulation.html",
+            "/phy/tutorials/notebooks/Pulse_Shaping_Basics.html",
+            "/phy/tutorials/notebooks/Optical_Lumped_Amplification_Channel.html",
+            "/phy/tutorials/notebooks/5G_Channel_Coding_Polar_vs_LDPC_Codes.html",
+            "/phy/tutorials/notebooks/5G_NR_PUSCH.html",
+            "/phy/tutorials/notebooks/Bit_Interleaved_Coded_Modulation.html",
+            "/phy/tutorials/notebooks/MIMO_OFDM_Transmissions_over_CDL.html",
+            "/phy/tutorials/notebooks/Neural_Receiver.html",
+            "/phy/tutorials/notebooks/Realistic_Multiuser_MIMO_Simulations.html",
+            "/phy/tutorials/notebooks/OFDM_MIMO_Detection.html",
+            "/phy/tutorials/notebooks/Introduction_to_Iterative_Detection_and_Decoding.html",
+            "/phy/tutorials/notebooks/Autoencoder.html",
+            "/phy/tutorials/notebooks/Weighted_BP_Algorithm.html",
+            "/phy/tutorials/notebooks/Superimposed_Pilots.html",
+            "/phy/tutorials/notebooks/CIR_Dataset.html",
+            "/phy/tutorials/notebooks/Link_Level_Simulations_with_RT.html",
+            # SYS
+            "/sys/tutorials/notebooks/PHY_Abstraction.html",
+            "/sys/tutorials/notebooks/LinkAdaptation.html",
+            "/sys/tutorials/notebooks/Scheduling.html",
+            "/sys/tutorials/notebooks/HexagonalGrid.html",
+            "/sys/tutorials/notebooks/Power_Control.html",
+            "/sys/tutorials/notebooks/SYS_Meets_RT.html",
+            "/sys/tutorials/notebooks/End-to-End_Example.html"
+        ]
     ]
 
     SEARCH_EXAMPLES = [
@@ -278,7 +326,9 @@ class SionnaDoc(ToolProvider):
         cache_dir = cfg.get("cache_dir_path", "api_doc_cache")
         vectorstore_path = cls._vectorstore_path(cache_dir)
 
-        if vectorstore_path.exists():
+        index_json = vectorstore_path / "index.json"
+        index_faiss = vectorstore_path / "index.faiss"
+        if index_json.exists() and index_faiss.exists():
             printer.log(f"SionnaDoc.build: Vectorstore already cached at {vectorstore_path}")
             return
 
@@ -333,10 +383,8 @@ class SionnaDoc(ToolProvider):
                 with open(summary_path, "r", encoding="utf-8") as f:
                     index_content = f.read()
                 printer.log(f"SionnaDoc.build: Using cached summary from {summary_path}")
-            else:
-                index_content = cleaned_content
 
-            if summarize_agent is not None:
+            elif summarize_agent is not None:
                 printer.log(f"SionnaDoc.build: Summarizing {doc.metadata['source']}")
                 try:
                     summary = summarize_agent.invoke({"messages":
@@ -345,7 +393,7 @@ class SionnaDoc(ToolProvider):
                     *Task:* Process the provided Markdown notebook into a clean, semantically rich format suitable for generating high-quality embeddings.
                     ...
                     *Input Notebook:*
-                    
+
                     {cleaned_content}""")]})
                     summary = summary["messages"][-1].content
                     summary_path = target_path.with_suffix(".summary.md")
@@ -354,6 +402,10 @@ class SionnaDoc(ToolProvider):
                     index_content = summary
                 except Exception as e:
                     printer.log(f"SionnaDoc.build: Failed to summarize: {e}")
+
+            else:
+                index_content = cleaned_content
+
 
             tutorial_documents.append(Document(
                 page_content=index_content,
@@ -435,9 +487,9 @@ class SionnaDoc(ToolProvider):
                  embedding_base_url: str,
                  reranker_model: str,
                  reranker_base_url: str,
-                 retrieve_k: int = 12,
-                 rerank_top_n: int = 4,
-                 cache_dir: str = "api_doc_cache"):
+                 retrieve_k: int,
+                 rerank_top_n: int,
+                 cache_dir: str):
         """
         Load a pre-built FAISS vectorstore using memory-mapping.
 
@@ -490,13 +542,11 @@ class SionnaDoc(ToolProvider):
             embeddings = HttpEmbeddings(embedding_model, embedding_base_url)
 
             index_faiss_path = str(vectorstore_path / "index.faiss")
-            index_pkl_path = str(vectorstore_path / "index.pkl")
 
             printer.log(f"SionnaDoc: Memory-mapping FAISS index from {index_faiss_path}")
             raw_index = faiss_lib.read_index(index_faiss_path, faiss_lib.IO_FLAG_MMAP)
 
-            with open(index_pkl_path, "rb") as f:
-                docstore, index_to_id = pickle.load(f)
+            docstore, index_to_id = FaissVectorStore.load_metadata(vectorstore_path)
 
             self._vectorstore = FaissVectorStore(
                 embeddings=embeddings,
@@ -680,12 +730,16 @@ Examples:
         if self._workspace is None:
             return "Error: Workspace not set. Cannot run help command."
         if not self._VALID_SYMBOL_RE.match(symbol):
-            return f"Error: Invalid symbol name '{symbol}'. Must be a dotted Python identifier (e.g. 'sionna.phy.ofdm.ResourceGrid')."
+            return (
+                f"Error: Invalid symbol name '{symbol}'. "
+                "Must be a dotted name under sionna (e.g. 'sionna.phy.ofdm.ResourceGrid')."
+            )
 
         python_code = f'''
 import sionna, inspect
+{self._RESOLVE_DOTTED_PY}
 try:
-    obj = eval("{symbol}")
+    obj = _resolve_dotted({symbol!r})
     sig = ""
     try:
         sig = str(inspect.signature(obj))
@@ -698,22 +752,27 @@ try:
 except Exception as e:
     print(f"Error: {{e}}")
     '''
-        return self._workspace._run_python_code(python_code)
+        return self._workspace._run_python_code_in_home(python_code)
 
     def _list(self, module: str) -> str:
         """Lists available functions and classes in a module."""
         if self._workspace is None:
             return "Error: Workspace not set. Cannot run list command."
         if not self._VALID_SYMBOL_RE.match(module):
-            return f"Error: Invalid module name '{module}'. Must be a dotted Python identifier (e.g. 'sionna.phy')."
+            return (
+                f"Error: Invalid module name '{module}'. "
+                "Must be a dotted name under sionna (e.g. 'sionna.phy')."
+            )
 
         python_code = f'''
 import sionna
+{self._RESOLVE_DOTTED_PY}
 try:
-    mod = eval("{module}")
+    mod = _resolve_dotted({module!r})
     items = [x for x in dir(mod) if not x.startswith("_")]
     print("\\n".join(items))
 except Exception as e:
     print(f"Error: {{e}}")
     '''
-        return self._workspace._run_python_code(python_code)
+        # See _help(): keep import-only introspection off the shared workspace.
+        return self._workspace._run_python_code_in_home(python_code)

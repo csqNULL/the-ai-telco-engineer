@@ -1,0 +1,1 @@
+{"top_k": 1536, "final_demap": "app", "full_iters": 2, "richardson_omega": 1.1337081961917974, "damp": 0.7969409005514498, "var_floor": 0.0009792813419696685, "prec_max": 2844.697925297721, "llr_scale": 0.8305590869966594, "no_scale": 1.6068722551696264, "a_cavity_weight": 1.7414626888766715, "tilt_fusion_weight": -0.4996029310144401, "lin_fusion_weight": 0.14488379543981972}

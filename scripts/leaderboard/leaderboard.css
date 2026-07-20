@@ -1,0 +1,81 @@
+body { background-color: #f5f5f5; }
+.card { margin-bottom: 1rem; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+.card-header { font-weight: 600; }
+.stat-card { text-align: center; padding: 1.5rem; }
+.stat-value { font-size: 2rem; font-weight: bold; color: #0d6efd; }
+.stat-label { color: #6c757d; font-size: 0.9rem; }
+.candidate-item {
+    cursor: pointer; padding: 8px 12px; border-radius: 4px;
+    margin: 2px 0; transition: background-color 0.2s;
+}
+.candidate-item:hover { background-color: #e9ecef; }
+.candidate-success { border-left: 4px solid #28a745; }
+.candidate-failed { border-left: 4px solid #dc3545; }
+.code-container {
+    max-height: 500px; overflow-y: auto; background-color: #1e1e1e;
+    color: #d4d4d4; padding: 1rem; border-radius: 4px;
+    font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 0.85rem; white-space: pre-wrap;
+}
+.params-container {
+    max-height: 500px; overflow-y: auto; padding: 0.25rem;
+    font-size: 0.85rem;
+}
+.params-container table { margin-bottom: 0; }
+.params-container code { word-break: break-all; }
+.metric-value { font-weight: bold; font-size: 0.9rem; }
+.metric-good { color: #28a745; }
+.metric-bad { color: #dc3545; }
+.cluster-name { font-family: monospace; font-size: 0.85rem; }
+.cluster-desc {
+    font-size: 0.8rem; color: #495057; margin-top: 4px;
+    line-height: 1.4; white-space: pre-wrap; word-wrap: break-word;
+}
+.cluster-header {
+    background-color: #e9ecef; padding: 0.5rem 1rem;
+    border-radius: 4px; margin-bottom: 0.5rem;
+}
+.generation-header {
+    background-color: #0d6efd; color: white;
+    padding: 0.4rem 0.75rem; border-radius: 4px;
+    margin: 1rem 0 0.5rem 0; font-weight: 600;
+    font-size: 0.95rem; cursor: pointer;
+    display: flex; justify-content: space-between; align-items: center;
+}
+.generation-header:hover { background-color: #0b5ed7; }
+.generation-header:first-child { margin-top: 0; }
+.collapse:not(.show) { display: none; }
+.nav-tabs .nav-link.active { font-weight: 600; }
+.query-box {
+    max-height: 400px; overflow-y: auto; background-color: #f8f9fa;
+    padding: 1rem; border-radius: 4px; font-size: 0.9rem;
+    white-space: pre-wrap;
+}
+
+.journal-log {
+    max-height: 70vh;
+    overflow-y: auto;
+    background-color: #1e1e1e;
+    color: #d4d4d4;
+    padding: 1rem;
+    border-radius: 4px;
+    font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 0.82rem;
+    white-space: pre-wrap;
+    line-height: 1.45;
+}
+.journal-controls select {
+    min-width: 160px;
+}
+
+.refresh-indicator {
+    display: inline-block; width: 8px; height: 8px;
+    border-radius: 50%; background-color: #28a745;
+    margin-right: 6px; animation: pulse 2s infinite;
+}
+.refresh-indicator.error {
+    background-color: #dc3545;
+}
+@keyframes pulse {
+    0% { opacity: 1; } 50% { opacity: 0.3; } 100% { opacity: 1; }
+}

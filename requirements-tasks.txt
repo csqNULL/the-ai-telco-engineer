@@ -1,4 +1,4 @@
 -r requirements.txt
-matplotlib
-sionna
-torch
+matplotlib==3.10.9
+sionna==2.0.1
+torch==2.12.0

@@ -2,4 +2,4 @@
 
 from .workspace import Workspace
 from .sionna_doc import SionnaDoc
-from .base import ToolProvider
+from .base import ToolProvider, EvalToolBase

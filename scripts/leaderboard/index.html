@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Leaderboard Viewer</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.2.0"></script>
+    <link rel="stylesheet" href="leaderboard.css">
+</head>
+<body>
+    <nav class="navbar navbar-dark bg-primary mb-4">
+        <div class="container">
+            <span class="navbar-brand mb-0 h1">Leaderboard Viewer</span>
+            <span class="navbar-text text-light">
+                <span class="refresh-indicator"></span>
+                Auto-refresh: <span id="refreshCountdown">5</span>s
+                &mdash; Last updated: <span id="lastUpdated">loading...</span>
+            </span>
+        </div>
+    </nav>
+
+    <div class="container-fluid">
+        <!-- Global Stats -->
+        <div class="row mb-4">
+            <div class="col-md-2"><div class="card stat-card"><div class="stat-value" id="statTotal">-</div><div class="stat-label">Total Candidates</div></div></div>
+            <div class="col-md-2"><div class="card stat-card"><div class="stat-value text-success" id="statSuccess">-</div><div class="stat-label">Successful</div></div></div>
+            <div class="col-md-2"><div class="card stat-card"><div class="stat-value text-danger" id="statFailed">-</div><div class="stat-label">Failed</div></div></div>
+            <div class="col-md-2"><div class="card stat-card"><div class="stat-value" id="statClusters">-</div><div class="stat-label">Ideas</div></div></div>
+            <div class="col-md-2"><div class="card stat-card"><div class="stat-value" id="statGens">-</div><div class="stat-label">Generations</div></div></div>
+            <div class="col-md-2"><div class="card stat-card"><div class="stat-value text-primary" id="statBest">-</div><div class="stat-label">Best Metric</div></div></div>
+        </div>
+
+        <!-- Tabs -->
+        <ul class="nav nav-tabs mb-3" id="mainTabs" role="tablist">
+            <li class="nav-item"><button class="nav-link active" data-tab="pareto">Pareto Front</button></li>
+            <li class="nav-item"><button class="nav-link" data-tab="clusters">Ideas</button></li>
+            <li class="nav-item"><button class="nav-link" data-tab="evolution">Evolution</button></li>
+            <li class="nav-item"><button class="nav-link" data-tab="query">Task Query</button></li>
+            <li class="nav-item"><button class="nav-link" data-tab="journals">Agent Journals</button></li>
+        </ul>
+
+        <div id="tabContent">
+            <!-- Pareto Front Tab -->
+            <div class="tab-pane" id="tab-pareto" style="display:block;">
+                <div class="row">
+                    <div class="col-12">
+                        <div class="card">
+                            <div class="card-header d-flex justify-content-between align-items-center">
+                                <span>Metric vs Complexity &mdash; 2D Pareto Front</span>
+                                <button class="btn btn-sm btn-outline-secondary" id="resetZoomBtn" style="display:none;" onclick="resetParetoZoom()">Reset Zoom</button>
+                            </div>
+                            <div class="card-body" style="position:relative; height:550px;">
+                                <canvas id="paretoChart"></canvas>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="row mt-2" id="paretoDetailRow" style="display:none;">
+                    <div class="col-12">
+                        <div class="card">
+                            <div class="card-header d-flex justify-content-between align-items-center">
+                                <span>Point Detail <span id="paretoDetailBadge" class="badge bg-primary ms-2"></span></span>
+                                <button class="btn btn-sm btn-outline-secondary" onclick="closeParetoDetail()">&times; Close</button>
+                            </div>
+                            <div class="card-body">
+                                <div id="paretoDetailInfo" class="mb-3"></div>
+                                <div class="row">
+                                    <div class="col-md-4">
+                                        <h6 class="mb-2">Hyperparameters</h6>
+                                        <div id="paretoDetailParams" class="params-container"></div>
+                                    </div>
+                                    <div class="col-md-8">
+                                        <h6 class="mb-2">Code (<code>solution.py</code>)</h6>
+                                        <div id="paretoDetailCode" class="code-container" style="display:none;"></div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Ideas Tab -->
+            <div class="tab-pane" id="tab-clusters" style="display:none;">
+                <div class="row">
+                    <div class="col-md-4">
+                        <div class="card">
+                            <div class="card-header">Ideas (<span id="clusterCount">0</span>)</div>
+                            <div class="card-body" id="clustersContainer" style="max-height: calc(100vh - 250px); overflow-y: auto;"></div>
+                        </div>
+                    </div>
+                    <div class="col-md-8">
+                        <div class="card">
+                            <div class="card-header">Candidate Details <span id="selectedCandidate" class="badge bg-primary ms-2"></span></div>
+                            <div class="card-body">
+                                <div id="candidateInfo" class="mb-3"><p class="text-muted">Select a candidate to view details</p></div>
+                                <div id="candidateCode" class="code-container" style="display: none;"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Evolution Tab -->
+            <div class="tab-pane" id="tab-evolution" style="display:none;">
+                <div class="row">
+                    <div class="col-md-8">
+                        <div class="card">
+                            <div class="card-header d-flex justify-content-between align-items-center">
+                                <span>Evolution Over Generations</span>
+                                <button class="btn btn-sm btn-outline-secondary" id="resetEvolutionZoomBtn" style="display:none;" onclick="resetEvolutionZoom()">Reset Zoom</button>
+                            </div>
+                            <div class="card-body" style="position:relative; height:450px;"><canvas id="evolutionChart"></canvas></div>
+                        </div>
+                    </div>
+                    <div class="col-md-4">
+                        <div class="card">
+                            <div class="card-header">Generation Summary</div>
+                            <div class="card-body" style="max-height: 400px; overflow-y: auto;">
+                                <table class="table table-sm">
+                                    <thead><tr><th>Gen</th><th>Total</th><th>Success</th><th>Failed</th></tr></thead>
+                                    <tbody id="genStatsBody"></tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Query Tab -->
+            <div class="tab-pane" id="tab-query" style="display:none;">
+                <div class="card">
+                    <div class="card-header">Task Query / Problem Statement</div>
+                    <div class="card-body"><div id="queryBox" class="query-box"></div></div>
+                </div>
+            </div>
+
+            <!-- Agent Journals Tab -->
+            <div class="tab-pane" id="tab-journals" style="display:none;">
+                <div class="row">
+                    <div class="col-12">
+                        <div class="card">
+                            <div class="card-header d-flex align-items-center justify-content-between flex-wrap journal-controls">
+                                <span>Agent Journal Log</span>
+                                <div class="d-flex align-items-center gap-2 mt-1 mt-md-0">
+                                    <label class="mb-0 fw-bold" for="journalGenSelect">Generation:</label>
+                                    <select id="journalGenSelect" class="form-select form-select-sm" onchange="onJournalGenChange()">
+                                    </select>
+                                    <label class="mb-0 fw-bold ms-2" for="journalAgentSelect">Agent:</label>
+                                    <select id="journalAgentSelect" class="form-select form-select-sm" onchange="onJournalAgentChange()">
+                                    </select>
+                                    <button class="btn btn-sm btn-outline-secondary ms-2" onclick="refreshJournal()" title="Refresh">&#x21bb;</button>
+                                    <div class="form-check form-switch ms-2 mb-0">
+                                        <input class="form-check-input" type="checkbox" id="journalAutoScroll" checked>
+                                        <label class="form-check-label" for="journalAutoScroll" style="font-size:0.8rem;">Auto-scroll</label>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="card-body">
+                                <div id="journalContent" class="journal-log"><span class="text-muted">Select a generation and agent to view the journal log.</span></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="leaderboard.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
