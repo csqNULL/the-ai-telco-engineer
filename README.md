@@ -25,6 +25,13 @@ A **task** is a self-contained folder providing everything AITE needs to tackle 
 
 Each task folder contains a notebook that reproduces the results reported in the paper, [OTFS.ipynb](tasks/otfs_detector/OTFS.ipynb) for the OTFS equalizer and [Pilotless.ipynb](tasks/pilotless/Pilotless.ipynb) for the pilotless receiver. For the `pilotless` task, pre-trained weights for the neural receiver baseline are available [here](https://drive.google.com/file/d/1yWbJ3Lk-efzLhDkqO5CSOnWW40Nhh6Wr/view?usp=sharing).
 
+Click on a preview below to watch a video showing of the Pareto front's evolution.
+
+<p align="center">
+  <a href="media/otfs.mp4"><img src="media/otfs-preview.png" width="380" hspace="20" alt="OTFS equalizer demonstration"></a>
+  <a href="media/pilotless.mp4"><img src="media/pilotless-preview.png" width="380" alt="Pilotless OFDM receiver demonstration"></a>
+</p>
+
 Running these tasks first requires installing their dependencies:
 
 ```bash
