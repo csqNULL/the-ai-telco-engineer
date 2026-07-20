@@ -28,8 +28,8 @@ Each task folder contains a notebook that reproduces the results reported in the
 Click on a preview below to watch a video showing of the Pareto front's evolution.
 
 <p align="center">
-  <a href="media/otfs.mp4"><img src="media/otfs-preview.png" width="380" hspace="20" alt="OTFS equalizer demonstration"></a>
-  <a href="media/pilotless.mp4"><img src="media/pilotless-preview.png" width="380" alt="Pilotless OFDM receiver demonstration"></a>
+  <a href="https://drive.google.com/file/d/1l4oopoCr3SqdnsfGp82c7wdCBhAu-en0/view?usp=sharing"><img src="media/otfs-preview.png" width="380" hspace="20" alt="OTFS equalizer demonstration"></a>
+  <a href="https://drive.google.com/file/d/1YybKsoVVWY5oBCSM5JtYakzLpcOQjsZV/view?usp=sharing"><img src="media/pilotless-preview.png" width="380" alt="Pilotless OFDM receiver demonstration"></a>
 </p>
 
 Running these tasks first requires installing their dependencies:
