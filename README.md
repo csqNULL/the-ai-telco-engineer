@@ -4,7 +4,7 @@ The AI Telco Engineer (AITE) is an agentic framework that deploys a swarm of par
 
 AITE implements an idea-driven, multi-objective optimization loop. An orchestrator LLM proposes `N` distinct algorithmic approaches (ideas) for the task. A population of `M` workers is distributed across those ideas, with each worker implementing and improving one assigned approach in its own isolated workspace. Each solution is evaluated on two objectives: a **task-specific metric** and a **complexity measure** (e.g. floating-point operations (FLOPs), parameter count, or inference time). After every worker run, multi-objective hyperparameter tuning (via [Optuna](https://optuna.org/)) produces a set of Pareto-optimal configurations per workspace. The global 2-D Pareto front across all workspaces then drives idea generation for subsequent generations, with the aim of pushing the front outward.
 
-This repository accompanies the paper ["Autonomous Discovery of Wireless Communications Algorithms"](report.pdf) and includes the two example tasks studied there: an equalizer for an orthogonal time–frequency space (OTFS) system, and a receiver for an orthogonal frequency-division multiplexing (OFDM) system that uses a custom constellation and operates without pilots.
+This repository accompanies the paper ["Autonomous Discovery of Wireless Communications Algorithms"](https://arxiv.org/pdf/2607.17762) and includes the two example tasks studied there: an equalizer for an orthogonal time–frequency space (OTFS) system, and a receiver for an orthogonal frequency-division multiplexing (OFDM) system that uses a custom constellation and operates without pilots.
 
 ## Setup
 
@@ -408,13 +408,12 @@ The embedding and reranker endpoints must speak the OpenAI-compatible protocol (
 
 ## How to Cite
 
-If you use this software, please cite it as:
-
 ```bibtex
-@software{the-ai-telco-engineer,
-  title  = {The AI Telco Engineer},
-  author = {{Aït Aoudia}, Fayçal and Hoydis, Jakob and Cammerer, Sebastian and Marti, Gian and Nimier-David, Merlin and Roussel, Nicolas and Keller, Alexander},
-  note   = {https://github.com/NVlabs/the-ai-telco-engineer},
-  year   = {2026}
+@article{aitaoudia2026autonomous,
+  title   = {Autonomous Discovery of Wireless Communications Algorithms},
+  author  = {{Aït Aoudia}, Fayçal and Hoydis, Jakob and Cammerer, Sebastian and Marti, Gian and Nimier-David, Merlin and Roussel, Nicolas and Keller, Alexander},
+  journal = {arXiv preprint arXiv:2607.17762},
+  year    = {2026},
+  url     = {https://arxiv.org/abs/2607.17762}
 }
 ```
